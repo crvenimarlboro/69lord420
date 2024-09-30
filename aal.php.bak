@@ -9,4 +9,3 @@ aa
 foreach( $array as $key => $value ){
     echo $key."\t=>\t".$value."\n";
 }
-aaa
