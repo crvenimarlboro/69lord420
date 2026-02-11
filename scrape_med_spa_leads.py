@@ -18,8 +18,9 @@ import csv
 import random
 import re
 import time
+from urllib.parse import quote_plus
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Set, Tuple
 
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
@@ -28,7 +29,12 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
+
+try:
+    # Preferred path requested in the original task.
+    from webdriver_manager.chrome import ChromeDriverManager
+except ModuleNotFoundError:
+    ChromeDriverManager = None
 
 
 SEARCH_QUERIES = [
@@ -76,8 +82,13 @@ def build_driver(headless: bool = True) -> webdriver.Chrome:
         "Chrome/122.0.0.0 Safari/537.36"
     )
 
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=chrome_options)
+    # If webdriver-manager is available, use it.
+    # If not, Selenium Manager (built into Selenium 4.6+) will auto-resolve driver.
+    if ChromeDriverManager is not None:
+        service = Service(ChromeDriverManager().install())
+        return webdriver.Chrome(service=service, options=chrome_options)
+
+    return webdriver.Chrome(options=chrome_options)
 
 
 def close_popups_if_present(driver: webdriver.Chrome) -> None:
@@ -98,31 +109,67 @@ def close_popups_if_present(driver: webdriver.Chrome) -> None:
 
 
 def open_maps_home(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
-    """Open Google Maps and wait for the search box to be ready."""
-    driver.get("https://www.google.com/maps")
-    close_popups_if_present(driver)
+    """
+    Open Google Maps and wait for UI readiness.
 
-    # CSS selector explanation:
-    # input#searchboxinput targets the main Google Maps search input element by ID.
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input#searchboxinput")))
+    Some machines get a region/consent shell where `input#searchboxinput` never renders.
+    We accept either the standard searchbox OR the left feed as readiness signals.
+    """
+    candidates = [
+        "https://www.google.com/maps?hl=en",
+        "https://maps.google.com/?hl=en",
+    ]
+
+    last_error: Exception | None = None
+    for url in candidates:
+        try:
+            driver.get(url)
+            close_popups_if_present(driver)
+
+            wait.until(
+                lambda d: (
+                    len(d.find_elements(By.CSS_SELECTOR, "input#searchboxinput")) > 0
+                    or len(d.find_elements(By.CSS_SELECTOR, "div[role='feed']")) > 0
+                )
+            )
+            return
+        except TimeoutException as exc:
+            last_error = exc
+
+    raise TimeoutException(
+        "Google Maps UI did not become ready (search box/feed not found)."
+    ) from last_error
+
+
+def open_query_via_url(driver: webdriver.Chrome, wait: WebDriverWait, query: str) -> None:
+    """Fallback navigation path: open a query directly via URL parameters."""
+    encoded = quote_plus(query)
+    driver.get(f"https://www.google.com/maps/search/?api=1&hl=en&query={encoded}")
+    close_popups_if_present(driver)
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[role='feed'] div.Nv2PK")))
 
 
 def submit_query(driver: webdriver.Chrome, wait: WebDriverWait, query: str) -> None:
     """Enter and submit a query in Google Maps."""
-    search_input = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#searchboxinput")))
-    search_input.clear()
-    search_input.send_keys(query)
+    try:
+        search_input = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#searchboxinput")))
+        search_input.clear()
+        search_input.send_keys(query)
 
-    # CSS selector explanation:
-    # button#searchbox-searchbutton is the magnifier button used to run the search.
-    driver.find_element(By.CSS_SELECTOR, "button#searchbox-searchbutton").click()
+        # CSS selector explanation:
+        # button#searchbox-searchbutton is the magnifier button used to run the search.
+        driver.find_element(By.CSS_SELECTOR, "button#searchbox-searchbutton").click()
 
-    # Wait until at least one result card appears.
-    # CSS selector explanation:
-    # div[role='feed'] is the scrollable left panel containing result cards in list mode.
-    # div.Nv2PK is a common class attached to each individual result card.
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[role='feed'] div.Nv2PK")))
-    human_sleep()
+        # Wait until at least one result card appears.
+        # CSS selector explanation:
+        # div[role='feed'] is the scrollable left panel containing result cards in list mode.
+        # div.Nv2PK is a common class attached to each individual result card.
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[role='feed'] div.Nv2PK")))
+        human_sleep()
+    except TimeoutException:
+        # Fallback for environments where the search box is not interactable/visible.
+        open_query_via_url(driver, wait, query)
+        human_sleep()
 
 
 def scroll_results_panel(driver: webdriver.Chrome, max_idle_rounds: int = 6) -> List:
